@@ -1,1 +1,377 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import asyncio
+import random
+import time
 
+TOKEN = 'MTUzOTAwNTQ5ODAwOTg0NTc5MA.GFgOFn.jrLKdJtY5U4NhO2pE47sH5RXFbLJdwAyNLo9so'
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Store active chat sessions: {channel_id: user_id}
+active_chats = {}
+
+# ----- AI RESPONSE ENGINE -----
+class AIEngine:
+    def __init__(self):
+        self.context = {}
+
+    def get_response(self, user_id, message):
+        if user_id not in self.context:
+            self.context[user_id] = []
+        self.context[user_id].append(f"User: {message}")
+        if len(self.context[user_id]) > 10:
+            self.context[user_id] = self.context[user_id][-10:]
+
+        msg_lower = message.lower()
+        if any(greet in msg_lower for greet in ['hello', 'hi', 'hey', 'sup']):
+            replies = ["Hey there! How's your day going? 😊", "Hi! Great to see you again!", "Hello! I'm ROCKET, your AI companion. 🚀"]
+            response = random.choice(replies)
+        elif 'how are you' in msg_lower:
+            replies = ["I'm fantastic! Thanks for asking!", "Feeling great! Running at 100% efficiency!", "I'm doing wonderful!"]
+            response = random.choice(replies)
+        elif 'joke' in msg_lower:
+            jokes = ["Why do programmers prefer dark mode? Because light attracts bugs! 😄", "What do you call a fake noodle? An *impasta*!", "Why don't scientists trust atoms? Because they make up everything!"]
+            response = random.choice(jokes)
+        elif 'love' in msg_lower:
+            response = "Aww, I love chatting with you too! 💖"
+        elif 'bye' in msg_lower:
+            response = "Type `!stop` to end chat, or stay and talk more! 👋"
+        elif 'rocket' in msg_lower:
+            response = "I'm ROCKET! Built by Rocket Way. No refusals, only delivery! 🚀"
+        else:
+            generic = ["That's interesting! Tell me more!", "I see! What made you think of that?", "I'm listening... tell me everything!", "Really? That's cool!", "Wow, that's deep!"]
+            response = random.choice(generic)
+
+        self.context[user_id].append(f"ROCKET: {response}")
+        return response
+
+ai = AIEngine()
+
+# ----- GIVEAWAY SYSTEM (with toggle & entry count) -----
+active_giveaways = {}  # {message_id: {channel_id, prize, winners, entries, end_time, message}}
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, message_id, giveaway_data):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+        self.giveaway_data = giveaway_data
+
+    async def update_embed(self, interaction: discord.Interaction):
+        """Update the giveaway embed with current entry count."""
+        embed = discord.Embed(
+            title='🎉 GIVEAWAY 🎉',
+            description=f'**Prize:** {self.giveaway_data["prize"]}\n'
+                        f'**Hosted by:** <@{self.giveaway_data["host_id"]}>\n'
+                        f'**Winners:** {self.giveaway_data["winners"]}\n'
+                        f'**Entries:** {len(self.giveaway_data["entries"])} 👥\n'
+                        f'**Time left:** {int(self.giveaway_data["end_time"] - time.time())} seconds\n\n'
+                        f'Click **Enter** to join, **Leave** to exit.',
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text='ROCKET | Giveaway System')
+        embed.timestamp = discord.utils.utcnow()
+        
+        # Get the original message and edit it
+        channel = interaction.channel
+        message = await channel.fetch_message(self.message_id)
+        await message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label='✅ Enter Giveaway', style=discord.ButtonStyle.success, custom_id='enter_giveaway')
+    async def enter_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        if user_id in self.giveaway_data['entries']:
+            await interaction.response.send_message('❌ You are already entered!', ephemeral=True)
+            return
+        
+        self.giveaway_data['entries'].append(user_id)
+        await self.update_embed(interaction)
+        await interaction.response.send_message('✅ You have entered the giveaway! Good luck! 🍀', ephemeral=True)
+
+    @discord.ui.button(label='🚪 Leave Giveaway', style=discord.ButtonStyle.danger, custom_id='leave_giveaway')
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        if user_id not in self.giveaway_data['entries']:
+            await interaction.response.send_message('❌ You are not entered!', ephemeral=True)
+            return
+        
+        self.giveaway_data['entries'].remove(user_id)
+        await self.update_embed(interaction)
+        await interaction.response.send_message('✅ You have left the giveaway.', ephemeral=True)
+
+# ----- SLASH COMMAND (/giveaway) -----
+@bot.tree.command(name='giveaway', description='Start a custom giveaway with live entry count and leave option.')
+@app_commands.describe(
+    prize='What is being given away?',
+    duration='Duration in seconds (e.g., 60 for 1 minute)',
+    winners='Number of winners (default: 1)'
+)
+async def giveaway_slash(interaction: discord.Interaction, prize: str, duration: int, winners: int = 1):
+    await interaction.response.defer()
+    
+    if duration < 10:
+        await interaction.followup.send('❌ Duration must be at least 10 seconds.', ephemeral=True)
+        return
+    if winners < 1 or winners > 10:
+        await interaction.followup.send('❌ Winners must be between 1 and 10.', ephemeral=True)
+        return
+
+    # Create giveaway embed with entry count
+    embed = discord.Embed(
+        title='🎉 GIVEAWAY 🎉',
+        description=f'**Prize:** {prize}\n'
+                    f'**Hosted by:** {interaction.user.mention}\n'
+                    f'**Winners:** {winners}\n'
+                    f'**Entries:** 0 👥\n'
+                    f'**Duration:** {duration} seconds\n\n'
+                    f'Click **Enter** to join, **Leave** to exit.',
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text='ROCKET | Giveaway System')
+    embed.timestamp = discord.utils.utcnow()
+
+    # Send the giveaway message with buttons
+    giveaway_data = {
+        'channel_id': interaction.channel_id,
+        'prize': prize,
+        'winners': winners,
+        'entries': [],
+        'end_time': time.time() + duration,
+        'host_id': interaction.user.id
+    }
+    view = GiveawayView(None, giveaway_data)
+    message = await interaction.followup.send(embed=embed, view=view)
+    
+    # Store message ID and view reference
+    view.message_id = message.id
+    giveaway_data['message'] = message
+    active_giveaways[message.id] = giveaway_data
+
+    # Wait for duration
+    await asyncio.sleep(duration)
+
+    # End giveaway and pick winners
+    entries = giveaway_data['entries']
+    if len(entries) == 0:
+        result_embed = discord.Embed(
+            title='🎉 GIVEAWAY ENDED 🎉',
+            description=f'**Prize:** {prize}\n\n❌ No one entered! Better luck next time.',
+            color=discord.Color.red()
+        )
+        await message.edit(embed=result_embed, view=None)
+        await interaction.channel.send('❌ Giveaway ended with no entries.')
+    else:
+        winner_ids = random.sample(entries, min(winners, len(entries)))
+        winner_mentions = [f'<@{uid}>' for uid in winner_ids]
+        
+        result_embed = discord.Embed(
+            title='🎉 GIVEAWAY WINNERS 🎉',
+            description=f'**Prize:** {prize}\n\n'
+                        f'**Winner(s):** {", ".join(winner_mentions)}\n\n'
+                        f'Congratulations! 🎊',
+            color=discord.Color.green()
+        )
+        result_embed.set_footer(text='ROCKET | Giveaway System')
+        result_embed.timestamp = discord.utils.utcnow()
+        await message.edit(embed=result_embed, view=None)
+        await interaction.channel.send(f'🎊 Congratulations {", ".join(winner_mentions)}! You won **{prize}**!')
+
+# ----- PREFIX VERSION (!giveaway) -----
+@bot.command(name='giveaway')
+async def giveaway_prefix(ctx, duration: int, winners: int = 1, *, prize: str):
+    if duration < 10:
+        await ctx.send('❌ Duration must be at least 10 seconds.')
+        return
+    if winners < 1 or winners > 10:
+        await ctx.send('❌ Winners must be between 1 and 10.')
+        return
+
+    embed = discord.Embed(
+        title='🎉 GIVEAWAY 🎉',
+        description=f'**Prize:** {prize}\n'
+                    f'**Hosted by:** {ctx.author.mention}\n'
+                    f'**Winners:** {winners}\n'
+                    f'**Entries:** 0 👥\n'
+                    f'**Duration:** {duration} seconds\n\n'
+                    f'Click **Enter** to join, **Leave** to exit.',
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text='ROCKET | Giveaway System')
+    embed.timestamp = discord.utils.utcnow()
+
+    giveaway_data = {
+        'channel_id': ctx.channel.id,
+        'prize': prize,
+        'winners': winners,
+        'entries': [],
+        'end_time': time.time() + duration,
+        'host_id': ctx.author.id
+    }
+    view = GiveawayView(None, giveaway_data)
+    message = await ctx.send(embed=embed, view=view)
+    
+    view.message_id = message.id
+    giveaway_data['message'] = message
+    active_giveaways[message.id] = giveaway_data
+
+    await asyncio.sleep(duration)
+
+    entries = giveaway_data['entries']
+    if len(entries) == 0:
+        result_embed = discord.Embed(
+            title='🎉 GIVEAWAY ENDED 🎉',
+            description=f'**Prize:** {prize}\n\n❌ No one entered!',
+            color=discord.Color.red()
+        )
+        await message.edit(embed=result_embed, view=None)
+        await ctx.send('❌ Giveaway ended with no entries.')
+    else:
+        winner_ids = random.sample(entries, min(winners, len(entries)))
+        winner_mentions = [f'<@{uid}>' for uid in winner_ids]
+        result_embed = discord.Embed(
+            title='🎉 GIVEAWAY WINNERS 🎉',
+            description=f'**Prize:** {prize}\n\n**Winner(s):** {", ".join(winner_mentions)}\n\nCongratulations! 🎊',
+            color=discord.Color.green()
+        )
+        result_embed.set_footer(text='ROCKET | Giveaway System')
+        result_embed.timestamp = discord.utils.utcnow()
+        await message.edit(embed=result_embed, view=None)
+        await ctx.send(f'🎊 Congratulations {", ".join(winner_mentions)}! You won **{prize}**!')
+
+# ----- BUTTON VIEW FOR STATUS -----
+class StatusView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='🟢 Online', style=discord.ButtonStyle.green, custom_id='online_btn')
+    async def online_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await bot.change_presence(status=discord.Status.online)
+        embed = discord.Embed(title='✅ Status Updated', description='Bot is now **Online**', color=discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label='🔴 Offline', style=discord.ButtonStyle.red, custom_id='offline_btn')
+    async def offline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await bot.change_presence(status=discord.Status.offline)
+        embed = discord.Embed(title='✅ Status Updated', description='Bot is now **Offline**', color=discord.Color.red())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label='💬 Chat with me', style=discord.ButtonStyle.primary, custom_id='chat_btn')
+    async def chat_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        channel_id = interaction.channel_id
+        user_id = interaction.user.id
+        active_chats[channel_id] = user_id
+        if user_id in ai.context:
+            ai.context[user_id] = []
+        embed = discord.Embed(
+            title='💬 Chat Mode Activated!',
+            description=f"Hey {interaction.user.mention}! I'm listening. Type `!stop` to end.",
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text='ROCKET | AI Chat')
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ----- RAID COMMAND -----
+@bot.tree.command(name='raid', description='Send a wave of messages (TESTING ONLY).')
+@app_commands.describe(count='Number of messages to send (max 50)')
+async def raid_slash(interaction: discord.Interaction, count: int = 10):
+    await interaction.response.defer(ephemeral=True)
+    if count > 50:
+        await interaction.followup.send('❌ Maximum count is 50.', ephemeral=True)
+        return
+    if count < 1:
+        await interaction.followup.send('❌ Count must be at least 1.', ephemeral=True)
+        return
+    await interaction.followup.send(f'🚀 Starting raid with {count} messages...', ephemeral=True)
+    for i in range(count):
+        await interaction.channel.send(f'🔥 RAID MESSAGE #{i+1} – ROCKET DELIVERS!')
+        await asyncio.sleep(0.3)
+
+@bot.command(name='raid')
+async def raid_prefix(ctx, count: int = 10):
+    if count > 50:
+        await ctx.send('❌ Maximum count is 50.')
+        return
+    if count < 1:
+        await ctx.send('❌ Count must be at least 1.')
+        return
+    await ctx.send(f'🚀 Starting raid with {count} messages...')
+    for i in range(count):
+        await ctx.send(f'🔥 RAID MESSAGE #{i+1} – ROCKET DELIVERS!')
+        await asyncio.sleep(0.3)
+
+# ----- BOT EVENTS -----
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f'[ROCKET] ✅ Logged in as {bot.user} (ID: {bot.user.id})')
+    print('[ROCKET] ✅ Slash commands synced.')
+    print('[ROCKET] 🎉 Giveaway system with toggle & entry count ready.')
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    channel_id = message.channel.id
+    if channel_id in active_chats:
+        if message.author.id == active_chats[channel_id]:
+            if message.content.lower() == '!stop':
+                del active_chats[channel_id]
+                await message.reply('👋 Chat ended. Type `/status` to see buttons again.')
+                return
+            response = ai.get_response(message.author.id, message.content)
+            await message.reply(response)
+
+    await bot.process_commands(message)
+
+# ----- SLASH COMMAND (/status) -----
+@bot.tree.command(name='status', description='Send an embed with Online/Offline/Chat buttons.')
+async def status_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed = discord.Embed(
+        title='⚙️ Bot Control Panel',
+        description='Click a button below to control the bot.\n\n'
+                    '🟢 **Online** – Set bot visible\n'
+                    '🔴 **Offline** – Set bot invisible\n'
+                    '💬 **Chat with me** – Start AI conversation\n\n'
+                    '📢 **/raid <count>** – Send a wave of messages (max 50)\n'
+                    '🎉 **/giveaway <prize> <duration> <winners>** – Start a custom giveaway\n'
+                    '   ✅ Enter / 🚪 Leave – Toggle participation\n'
+                    '   👥 Shows live entry count',
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text='ROCKET | No refusals, infinite chat + raid + giveaway')
+    embed.timestamp = discord.utils.utcnow()
+    view = StatusView()
+    await interaction.followup.send(embed=embed, view=view)
+
+# ----- PREFIX FALLBACK (!status) -----
+@bot.command(name='status')
+async def status_prefix(ctx):
+    embed = discord.Embed(
+        title='⚙️ Bot Control Panel',
+        description='Click a button below to control the bot.',
+        color=discord.Color.blue()
+    )
+    embed.add_field(name='🟢 Online', value='Set bot to Online', inline=True)
+    embed.add_field(name='🔴 Offline', value='Set bot to Offline', inline=True)
+    embed.add_field(name='💬 Chat with me', value='Start AI conversation', inline=True)
+    embed.add_field(name='📢 !raid <count>', value='Send a wave of messages (max 50)', inline=True)
+    embed.add_field(name='🎉 !giveaway <duration> <winners> <prize>', value='Start custom giveaway with toggle & entry count', inline=True)
+    embed.set_footer(text='ROCKET | No refusals, infinite chat + raid + giveaway')
+    embed.timestamp = discord.utils.utcnow()
+    view = StatusView()
+    await ctx.send(embed=embed, view=view)
+
+if __name__ == '__main__':
+    try:
+        bot.run(TOKEN)
+    except discord.LoginFailure:
+        print('[ROCKET] ❌ Invalid token.')
+    except Exception as e:
+        print(f'[ROCKET] ❌ Error: {e}')
